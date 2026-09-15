@@ -1,0 +1,141 @@
+name: Watch mem0ai/mem0 server/
+
+on:
+  schedule:
+    # Hourly — server/ rarely moves; cheap no-op when SHA unchanged
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if upstream-server.sha already matches"
+        type: boolean
+        default: false
+      ref:
+        description: "Optional mem0ai/mem0 git SHA (default: latest commit touching server/)"
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  SERVER_IMAGE: ghcr.io/nickberardi/mem0-server
+  DASHBOARD_IMAGE: ghcr.io/nickberardi/mem0-dashboard
+  UPSTREAM_REPO: mem0ai/mem0
+
+jobs:
+  detect-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream server SHA
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.ref }}" ]; then
+            SHA="${{ inputs.ref }}"
+          else
+            SHA=$(gh api "repos/${UPSTREAM_REPO}/commits?path=server&per_page=1" --jq '.[0].sha')
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Resolved upstream server SHA: $SHA"
+
+      - name: Compare to last built SHA
+        id: gate
+        run: |
+          set -euo pipefail
+          LAST=""
+          if [ -f upstream-server.sha ]; then
+            LAST=$(tr -d '[:space:]' < upstream-server.sha)
+          fi
+          echo "last=$LAST" >> "$GITHUB_OUTPUT"
+          FORCE="${{ inputs.force }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            FORCE=false
+          fi
+          if [ "$FORCE" = "true" ] || [ "$LAST" != "${{ steps.upstream.outputs.sha }}" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Build needed (last='$LAST' new='${{ steps.upstream.outputs.sha }}' force='$FORCE')"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "No server/ change since $LAST — skip build"
+          fi
+
+      - name: Checkout mem0ai/mem0 at SHA
+        if: steps.gate.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: mem0ai/mem0
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: upstream-mem0
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push mem0-server
+        if: steps.gate.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream-mem0/server
+          file: docker/Dockerfile.server
+          push: true
+          tags: |
+            ${{ env.SERVER_IMAGE }}:${{ steps.upstream.outputs.sha }}
+            ${{ env.SERVER_IMAGE }}:${{ steps.upstream.outputs.short }}
+            ${{ env.SERVER_IMAGE }}:latest
+          cache-from: type=gha,scope=mem0-server
+          cache-to: type=gha,mode=max,scope=mem0-server
+          labels: |
+            org.opencontainers.image.source=https://github.com/mem0ai/mem0
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+
+      - name: Build and push mem0-dashboard
+        if: steps.gate.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream-mem0/server/dashboard
+          file: upstream-mem0/server/dashboard/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DASHBOARD_IMAGE }}:${{ steps.upstream.outputs.sha }}
+            ${{ env.DASHBOARD_IMAGE }}:${{ steps.upstream.outputs.short }}
+            ${{ env.DASHBOARD_IMAGE }}:latest
+          cache-from: type=gha,scope=mem0-dashboard
+          cache-to: type=gha,mode=max,scope=mem0-dashboard
+          labels: |
+            org.opencontainers.image.source=https://github.com/mem0ai/mem0
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+
+      - name: Record upstream-server.sha
+        if: steps.gate.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          echo -n "${{ steps.upstream.outputs.sha }}" > upstream-server.sha
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add upstream-server.sha
+          if git diff --staged --quiet; then
+            echo "SHA file already current"
+            exit 0
+          fi
+          git commit -m "chore: bump upstream-server.sha to ${{ steps.upstream.outputs.short }}"
+          # Push to the branch that triggered the workflow (main after merge)
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin "HEAD:${{ github.ref_name }}"

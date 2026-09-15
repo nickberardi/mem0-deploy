@@ -1,0 +1,89 @@
+name: mem0
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -d postgres -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_db:/var/lib/postgresql/data
+    networks:
+      - mem0_network
+
+  mem0:
+    image: ${MEM0_IMAGE:-ghcr.io/nickberardi/mem0-server:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${MEM0_PORT:-8888}:8000"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_COLLECTION_NAME: ${POSTGRES_COLLECTION_NAME:-memories}
+      APP_DB_NAME: ${APP_DB_NAME:-mem0_app}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-ollama}
+      MEM0_DEFAULT_LLM_MODEL: ${MEM0_DEFAULT_LLM_MODEL:-gemma4:latest}
+      MEM0_DEFAULT_EMBEDDER_MODEL: ${MEM0_DEFAULT_EMBEDDER_MODEL:-nomic-embed-text}
+      DASHBOARD_URL: ${DASHBOARD_URL}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      REQUEST_LOG_RETENTION_DAYS: ${REQUEST_LOG_RETENTION_DAYS:-30}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - mem0_history:/app/history
+    networks:
+      - mem0_network
+
+  mem0-dashboard:
+    image: ${MEM0_DASHBOARD_IMAGE:-ghcr.io/nickberardi/mem0-dashboard:latest}
+    restart: unless-stopped
+    depends_on:
+      mem0:
+        condition: service_started
+    ports:
+      - "${MEM0_DASHBOARD_PORT:-3000}:3000"
+    environment:
+      API_INTERNAL_URL: ${API_INTERNAL_URL:-http://mem0:8000}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_PUBLIC_INSTANCE_NAME: ${NEXT_PUBLIC_INSTANCE_NAME:-Mem0}
+      DASHBOARD_URL: ${DASHBOARD_URL}
+      NEXT_TELEMETRY_DISABLED: ${NEXT_TELEMETRY_DISABLED:-1}
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    networks:
+      - mem0_network
+
+volumes:
+  postgres_db:
+    external: true
+    name: mem0_postgres_db
+  mem0_history:
+    external: true
+    name: mem0_mem0_history
+
+networks:
+  mem0_network:
+    external: true
+    name: mem0_mem0_network
